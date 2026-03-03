@@ -56,7 +56,7 @@ class AuditLog(Base):
     action: Mapped[str] = mapped_column(String(50), nullable=False)  # e.g. "delete_file", "connect_gdrive"
     resource_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # e.g. "file_record"
     resource_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
-    metadata: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    meta: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     ip_address: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
     user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
