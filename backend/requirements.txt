@@ -37,4 +37,8 @@ openpyxl==3.1.4
 pandas==2.2.2
 PyJWT==2.8.0
 qrcode==7.4.2
+<<<<<<< HEAD
 python-slugify==8.0.4
+=======
+python-slugify==8.0.4
+>>>>>>> ed36135 (add check.py and alembic.ini)
