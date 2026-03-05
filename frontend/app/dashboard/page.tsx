@@ -394,3 +394,75 @@ function generateDemoManifest() {
   }
   return files
 }
+
+const handleLocalScan = async (connectionId: string) => {
+  try {
+    // Ask browser to pick a folder
+    const dirHandle = await (window as any).showDirectoryPicker({
+      mode: 'read'
+    });
+
+    // Read all files recursively
+    const files = await readDirectory(dirHandle, '');
+    
+    // Create scan job
+    const scan = await api.scans.create({ 
+      connection_id: connectionId, 
+      scan_type: 'full' 
+    });
+
+    // Send files in batches of 500
+    const batchSize = 500;
+    for (let i = 0; i < files.length; i += batchSize) {
+      const batch = files.slice(i, i + batchSize);
+      const isLast = i + batchSize >= files.length;
+      await api.scans.ingest({
+        scan_job_id: scan.id,
+        files: batch,
+        is_final_chunk: isLast
+      });
+    }
+
+    // Redirect to results
+    router.push('/duplicates');
+
+  } catch (err: any) {
+    if (err.name !== 'AbortError') {
+      console.error('Scan error:', err);
+    }
+  }
+};
+
+// Recursively read directory
+async function readDirectory(dirHandle: any, path: string): Promise<any[]> {
+  const files: any[] = [];
+  
+  for await (const [name, handle] of dirHandle) {
+    const fullPath = path ? `${path}/${name}` : `/${name}`;
+    
+    if (handle.kind === 'file') {
+      const file = await handle.getFile();
+      
+      // Compute MD5 hash
+      const buffer = await file.arrayBuffer();
+      const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      const hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+      
+      files.push({
+        file_name: name,
+        file_path: fullPath,
+        file_size: file.size,
+        mime_type: file.type || 'application/octet-stream',
+        md5_hash: hash,
+        last_modified: new Date(file.lastModified).toISOString()
+      });
+    } else if (handle.kind === 'directory') {
+      // Recurse into subdirectory
+      const subFiles = await readDirectory(handle, fullPath);
+      files.push(...subFiles);
+    }
+  }
+  
+  return files;
+}
