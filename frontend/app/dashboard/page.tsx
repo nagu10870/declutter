@@ -9,6 +9,7 @@ import {
 } from 'lucide-react'
 import Link from 'next/link'
 import toast from 'react-hot-toast'
+import { api } from '@/lib/api'
 
 export default function DashboardPage() {
   const { user } = useAuthStore()
