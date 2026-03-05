@@ -14,19 +14,55 @@ import {
 import Link from 'next/link'
 import toast from 'react-hot-toast'
 
-// ── Recursive directory reader using File System Access API ───────────────
-async function readDirectory(dirHandle: any, path: string): Promise<FileManifestItem[]> {
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
+function getTimeOfDay() {
+  const h = new Date().getHours()
+  if (h < 12) return 'morning'
+  if (h < 17) return 'afternoon'
+  return 'evening'
+}
+
+// ── Recursive directory reader ─────────────────────────────────────────────
+async function readDirectory(
+  dirHandle: any,
+  path: string,
+  onProgress?: (msg: string) => void
+): Promise<FileManifestItem[]> {
   const files: FileManifestItem[] = []
+
   for await (const [name, handle] of dirHandle) {
     const fullPath = path ? `${path}/${name}` : `/${name}`
+
     if (handle.kind === 'file') {
       try {
         const file = await handle.getFile()
-        // Compute MD5-compatible hash using SHA-256 (browser crypto API)
+
+        // Skip files over 50MB — too slow to hash in browser
+        if (file.size > 50 * 1024 * 1024) {
+          files.push({
+            file_name: name,
+            file_path: fullPath,
+            file_size: file.size,
+            mime_type: file.type || 'application/octet-stream',
+            md5_hash: `large_${file.size}_${name.replace(/\s/g, '_')}`,
+            last_modified: new Date(file.lastModified).toISOString(),
+          })
+          continue
+        }
+
+        onProgress?.(`Hashing: ${name}`)
+
+        // Compute SHA-256 hash using browser crypto API
         const buffer = await file.arrayBuffer()
         const hashBuffer = await crypto.subtle.digest('SHA-256', buffer)
         const hashArray = Array.from(new Uint8Array(hashBuffer))
         const hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
+
         files.push({
           file_name: name,
           file_path: fullPath,
@@ -36,17 +72,17 @@ async function readDirectory(dirHandle: any, path: string): Promise<FileManifest
           last_modified: new Date(file.lastModified).toISOString(),
         })
       } catch {
-        // Skip files we can't read (permissions, system files)
+        // Skip unreadable files silently
       }
     } else if (handle.kind === 'directory') {
-      const subFiles = await readDirectory(handle, fullPath)
+      const subFiles = await readDirectory(handle, fullPath, onProgress)
       files.push(...subFiles)
     }
   }
   return files
 }
 
-// ── Demo manifest for testing without real files ──────────────────────────
+// ── Demo manifest for testing ──────────────────────────────────────────────
 function generateDemoManifest(): FileManifestItem[] {
   const files: FileManifestItem[] = []
   const basePath = '/Users/demo/Documents'
@@ -64,17 +100,6 @@ function generateDemoManifest(): FileManifestItem[] {
     })
   }
   return files
-}
-
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms))
-}
-
-function getTimeOfDay() {
-  const h = new Date().getHours()
-  if (h < 12) return 'morning'
-  if (h < 17) return 'afternoon'
-  return 'evening'
 }
 
 // ── Main component ─────────────────────────────────────────────────────────
@@ -107,7 +132,7 @@ export default function DashboardPage() {
     }
   }
 
-  // ── Ensure local connection exists, return its ID ────────────────────────
+  // ── Ensure local connection exists, return its ID ─────────────────────────
   const ensureLocalConnection = async (): Promise<string> => {
     const localConn = connections.find((c) => c.provider === 'local')
     if (localConn) return localConn.id
@@ -116,23 +141,10 @@ export default function DashboardPage() {
     return newConn.data.id
   }
 
-  // ── Ingest files in batches ───────────────────────────────────────────────
-  const ingestFiles = async (jobId: string, files: FileManifestItem[]) => {
-    const CHUNK_SIZE = 500
-    for (let i = 0; i < files.length; i += CHUNK_SIZE) {
-      const chunk = files.slice(i, i + CHUNK_SIZE)
-      const isLast = i + CHUNK_SIZE >= files.length
-      await scansApi.ingestChunk({ job_id: jobId, files: chunk, is_final_chunk: isLast })
-      setScanProgress(Math.min(99, Math.round(((i + chunk.length) / files.length) * 100)))
-    }
-    setScanProgress(100)
-  }
-
-  // ── Real local folder scan using File System Access API ──────────────────
+  // ── Real local folder scan ────────────────────────────────────────────────
   const handleLocalFolderScan = useCallback(async () => {
-    // Check browser support
     if (!('showDirectoryPicker' in window)) {
-      toast.error('Your browser does not support folder scanning. Please use Chrome or Edge.')
+      toast.error('Folder scanning requires Chrome or Edge browser.')
       return
     }
 
@@ -143,15 +155,17 @@ export default function DashboardPage() {
     try {
       // Open folder picker
       const dirHandle = await (window as any).showDirectoryPicker({ mode: 'read' })
-
-      setScanStatus('Reading files...')
       const connId = await ensureLocalConnection()
 
-      // Read all files from selected folder
-      const files = await readDirectory(dirHandle, `/${dirHandle.name}`)
+      setScanStatus('Reading and hashing files...')
+      const files = await readDirectory(dirHandle, `/${dirHandle.name}`, (msg) => {
+        setScanStatus(msg)
+      })
 
       if (files.length === 0) {
         toast.error('No files found in the selected folder.')
+        setIsScanning(false)
+        setScanStatus('')
         return
       }
 
@@ -165,17 +179,30 @@ export default function DashboardPage() {
       })
       const jobId = jobRes.data.id
 
-      setScanStatus(`Scanning ${files.length} files for duplicates...`)
-      await ingestFiles(jobId, files)
+      // Send in batches of 500 with progress
+      const CHUNK_SIZE = 500
+      for (let i = 0; i < files.length; i += CHUNK_SIZE) {
+        const chunk = files.slice(i, i + CHUNK_SIZE)
+        const isLast = i + CHUNK_SIZE >= files.length
+        await scansApi.ingestChunk({ job_id: jobId, files: chunk, is_final_chunk: isLast })
+        const done = Math.min(i + chunk.length, files.length)
+        setScanProgress(Math.round((done / files.length) * 99))
+        setScanStatus(`Indexing files... ${done} / ${files.length}`)
+      }
 
-      toast.success(`Scan complete! ${files.length} files indexed.`)
+      setScanProgress(100)
+      setScanStatus('Scan complete!')
+      await sleep(600)
+
+      toast.success(`✅ ${files.length} files scanned!`)
       await loadData()
       router.push('/duplicates')
 
     } catch (err: any) {
       if (err.name === 'AbortError') {
-        // User cancelled folder picker — no error needed
+        // User cancelled picker — no error needed
       } else {
+        console.error('Scan error:', err)
         toast.error(err?.response?.data?.detail || err?.message || 'Scan failed')
       }
     } finally {
@@ -185,11 +212,12 @@ export default function DashboardPage() {
     }
   }, [connections, router])
 
-  // ── Demo scan (generates fake data for testing) ──────────────────────────
+  // ── Demo scan ─────────────────────────────────────────────────────────────
   const handleDemoScan = async () => {
     setIsScanning(true)
     setScanProgress(0)
-    setScanStatus('Running demo scan...')
+    setScanStatus('Running demo scan with sample files...')
+
     try {
       const connId = await ensureLocalConnection()
 
@@ -207,12 +235,16 @@ export default function DashboardPage() {
         const isLast = i + CHUNK_SIZE >= demoFiles.length
         await scansApi.ingestChunk({ job_id: jobId, files: chunk, is_final_chunk: isLast })
         setScanProgress(Math.min(100, Math.round(((i + CHUNK_SIZE) / demoFiles.length) * 100)))
+        setScanStatus(`Loading sample files... ${Math.min(i + CHUNK_SIZE, demoFiles.length)} / ${demoFiles.length}`)
         await sleep(200)
       }
 
       toast.success('Demo scan complete! Sample duplicates loaded.')
       await loadData()
+      router.push('/duplicates')
+
     } catch (err: any) {
+      console.error('Demo scan error:', err)
       toast.error(err?.response?.data?.detail || 'Demo scan failed')
     } finally {
       setIsScanning(false)
@@ -263,7 +295,7 @@ export default function DashboardPage() {
             onClick={handleDemoScan}
             disabled={isScanning}
             className="btn-primary flex items-center gap-2"
-            title="Load sample data to see how the app works"
+            title="Load sample data to explore the app"
           >
             {isScanning ? (
               <RefreshCw className="w-4 h-4 animate-spin" />
@@ -279,8 +311,8 @@ export default function DashboardPage() {
       {isScanning && (
         <div className="card p-4">
           <div className="flex items-center justify-between mb-2">
-            <span className="text-sm text-ink-muted">{scanStatus || 'Scanning files...'}</span>
-            <span className="text-sm font-mono text-brand">{scanProgress}%</span>
+            <span className="text-sm text-ink-muted truncate max-w-xs">{scanStatus || 'Scanning files...'}</span>
+            <span className="text-sm font-mono text-brand ml-2">{scanProgress}%</span>
           </div>
           <div className="w-full h-2 bg-surface-overlay rounded-full overflow-hidden">
             <div
@@ -334,9 +366,9 @@ export default function DashboardPage() {
           </div>
           <h2 className="font-display text-2xl font-bold mb-2">Ready to declutter?</h2>
           <p className="text-ink-muted max-w-md leading-relaxed mb-8">
-            Run a scan to discover duplicate files, free up storage space, and get AI-powered organization suggestions.
+            Scan a real folder on your computer, or run a demo scan to explore the app with sample data.
           </p>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 flex-wrap justify-center">
             {canPickFolder && (
               <button
                 onClick={handleLocalFolderScan}
@@ -353,9 +385,9 @@ export default function DashboardPage() {
             </button>
           </div>
           {canPickFolder && (
-            <p className="text-xs text-ink-faint mt-4">
-              "Scan Real Folder" reads files from your computer.
-              "Run Demo Scan" loads sample data to explore the app.
+            <p className="text-xs text-ink-faint mt-5 max-w-sm">
+              <strong className="text-ink-muted">Scan Real Folder</strong> reads files from your computer — nothing is uploaded.{' '}
+              <strong className="text-ink-muted">Demo Scan</strong> loads sample data to explore the app.
             </p>
           )}
         </div>
@@ -455,7 +487,7 @@ export default function DashboardPage() {
   )
 }
 
-// ── Sub-components ─────────────────────────────────────────────────────────
+// ── Sub-components ──────────────────────────────────────────────────────────
 
 function CloudConnectPrompt({ provider, icon, href }: { provider: string; icon: string; href: string }) {
   return (
